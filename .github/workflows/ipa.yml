@@ -1,0 +1,34 @@
+name: Build unsigned IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [sideload-build]
+jobs:
+  ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_26.app 2>/dev/null || true; xcodebuild -version
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: apps/house-capture
+        run: xcodegen generate
+      - name: Build (no signing)
+        working-directory: apps/house-capture
+        run: |
+          xcodebuild -project HouseCapture.xcodeproj -scheme HouseCapture -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | xcpretty || true
+          test -d build/Build/Products/Release-iphoneos/HouseCapture.app
+      - name: Package IPA
+        working-directory: apps/house-capture
+        run: |
+          mkdir -p Payload && cp -R build/Build/Products/Release-iphoneos/HouseCapture.app Payload/
+          zip -qr 3DModelAnything-unsigned.ipa Payload
+          ls -la 3DModelAnything-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 3DModelAnything-unsigned-ipa
+          path: apps/house-capture/3DModelAnything-unsigned.ipa
