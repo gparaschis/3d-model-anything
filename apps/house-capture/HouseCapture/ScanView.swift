@@ -70,6 +70,10 @@ final class ScanView: NSObject, ARSCNViewDelegate {
   /// isn't the zone's yet, and the engine keeps every anchor it's given) and while paused.
   /// Read on SceneKit's render thread.
   nonisolated let feed = FeedGate()
+  /// When ARSCNView last handed over a mesh anchor (render thread), for the capture's mesh watchdog
+  nonisolated let meshCallbacks = CallbackClock()
+  /// coverage nodes placed by `refeedEngine` for anchors the view never reported
+  private var fallbackNodes: [UUID: SCNNode] = [:]
   /// earlier scans of the zone (Continue sessions), drawn under the live mesh
   private let ghost = SCNNode()
   private let ghostEdges = SCNNode()
@@ -146,8 +150,22 @@ final class ScanView: NSObject, ARSCNViewDelegate {
 
   /// Hand every live mesh anchor to the engine again (after it wasn't fed for a while).
   /// Copying the buffers is heavy, so it happens off main; holding the anchors keeps them valid.
-  func refeedEngine(from session: ARSession) {
+  /// `placeMissingNodes`: also give anchors the view never reported a node of their own, so
+  /// the coverage overlay still draws (only used when the view's mesh callbacks stopped).
+  func refeedEngine(from session: ARSession, placeMissingNodes: Bool = false) {
     let anchors = session.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+    if placeMissingNodes {
+      for a in anchors {
+        if let node = fallbackNodes[a.identifier] { node.simdTransform = a.transform; continue }
+        guard nodes[a.identifier] == nil else { continue }
+        let node = SCNNode()
+        node.simdTransform = a.transform
+        view.scene.rootNode.addChildNode(node)
+        fallbackNodes[a.identifier] = node
+        nodes[a.identifier] = node
+        if let m = waiting.removeValue(forKey: a.identifier) { apply([m]) }
+      }
+    }
     let engine = engine
     DispatchQueue.global(qos: .userInitiated).async {
       for a in anchors { engine.update(a) }
@@ -208,10 +226,12 @@ final class ScanView: NSObject, ARSCNViewDelegate {
 
   nonisolated func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
     guard let mesh = anchor as? ARMeshAnchor else { return nil }
+    meshCallbacks.touch()
     if feed.isOn { engine.update(mesh) }
     let node = SCNNode()
     let id = mesh.identifier
     Task { @MainActor in
+      self.fallbackNodes.removeValue(forKey: id)?.removeFromParentNode()
       self.nodes[id] = node
       if let m = self.waiting.removeValue(forKey: id) { self.apply([m]) }
     }
@@ -219,7 +239,9 @@ final class ScanView: NSObject, ARSCNViewDelegate {
   }
 
   nonisolated func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
-    guard let mesh = anchor as? ARMeshAnchor, feed.isOn else { return }
+    guard let mesh = anchor as? ARMeshAnchor else { return }
+    meshCallbacks.touch()
+    guard feed.isOn else { return }
     engine.update(mesh)
   }
 
@@ -287,6 +309,14 @@ final class ScanView: NSObject, ARSCNViewDelegate {
       }
     }
   }
+}
+
+/// Thread-safe time of the latest event (CACurrentMediaTime), 0 before the first
+final class CallbackClock: @unchecked Sendable {
+  private let lock = NSLock()
+  private var last: CFTimeInterval = 0
+  func touch() { lock.withLock { last = CACurrentMediaTime() } }
+  var lastTime: CFTimeInterval { lock.withLock { last } }
 }
 
 /// A thread-safe on/off switch

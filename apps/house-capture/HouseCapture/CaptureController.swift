@@ -166,6 +166,9 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
   private var lastPosePublish: TimeInterval = 0
   private var lastEvaluate: TimeInterval = 0
   private var lastMeshCheck: TimeInterval = 0
+  private var lastMeshRefeed: TimeInterval = 0
+  private var meshWatchLogged = false
+  private var noMeshAnchorsLogged = false
   private var lastBlur: Float?
   private var candidate: Shot?
   private var highResSupported = true
@@ -671,6 +674,8 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     recovery = TrackingRecovery()
     trackingIssue = recovery.issue
     meshReadyAt = nil
+    meshWatchLogged = false
+    noMeshAnchorsLogged = false
     preStopMesh = nil
     lastWarning = nil
     instruction = nil
@@ -808,6 +813,15 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     if case .success(let r)? = result, r.vertices > 0 {
       record.mesh = MeshRecord(file: meshFile, anchors: 0, vertices: r.vertices, faces: r.faces)
       record.coverage = r.covered
+    } else {
+      let anchors = arSession.currentFrame?.anchors.reduce(0) { $1 is ARMeshAnchor ? $0 + 1 : $0 } ?? -1
+      let why: String
+      switch result {
+      case .failure(let e)?: why = e.localizedDescription
+      case .success?: why = "0 vertices"
+      case nil: why = "no export"
+      }
+      diagnostics.log("room \(index) mesh not saved (\(why)): \(anchors) mesh anchors in the frame, last view mesh callback \(String(format: "%.1f", CACurrentMediaTime() - scanView.meshCallbacks.lastTime)) s ago, config \(diagnostics.detailConfiguration ?? "-")", since: startedAt)
     }
     record.photoCoverage = record.photographedPercent
     record.detailSeconds = roomStartedAt.map { Date().timeIntervalSince($0) }
@@ -1114,6 +1128,32 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     arSession.run(updated, options: []) // no reset: same world, RoomPlan keeps going
   }
 
+  /// The coverage engine is fed by ARSCNView's anchor callbacks. If those stop while ARKit
+  /// still has mesh anchors (seen on device: a room saved without mesh or overlay), feed the
+  /// engine from the frame instead so the mesh is still recorded. In a normal scan the view
+  /// reports mesh updates many times a second and this never fires.
+  private func watchMesh(_ frame: ARFrame, now: TimeInterval) {
+    guard meshReady, !paused, captureReady, let readyAt = meshReadyAt, now - readyAt > 3 else { return }
+    let anchors = frame.anchors.reduce(0) { $1 is ARMeshAnchor ? $0 + 1 : $0 }
+    guard anchors > 0 else {
+      if !noMeshAnchorsLogged, now - readyAt > 10 {
+        noMeshAnchorsLogged = true
+        diagnostics.log("mesh watchdog: ARKit has no mesh anchors \(Int(now - readyAt)) s after mesh was enabled", since: startedAt)
+      }
+      return
+    }
+    let last = scanView.meshCallbacks.lastTime
+    let quiet = now - max(last, readyAt)
+    guard quiet > 10, now - lastMeshRefeed > 2 else { return }
+    lastMeshRefeed = now
+    if !meshWatchLogged {
+      meshWatchLogged = true
+      diagnostics.log("mesh watchdog: no mesh callbacks from the view for \(Int(quiet)) s (\(last == 0 ? "never" : "stopped")) with \(anchors) anchors in the frame; feeding the engine from ARFrame", since: startedAt)
+      sampleDiagnostics(force: true)
+    }
+    scanView.refeedEngine(from: arSession, placeMissingNodes: true)
+  }
+
   @objc private func memoryWarning() {
     guard !closed else { return }
     memoryPressureUntil = CACurrentMediaTime() + 60
@@ -1317,6 +1357,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
     if frame.timestamp - lastMeshCheck > 0.5 {
       lastMeshCheck = frame.timestamp
       ensureMeshAndDepth()
+      watchMesh(frame, now: now)
     }
     if !cameraControl.whiteBalanceLocked, let t = meshReadyAt, now - t > 3 {
       cameraControl.lockWhiteBalance()
