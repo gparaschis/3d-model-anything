@@ -2,7 +2,7 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
   push:
-    branches: [sideload-build]
+    branches: [sideload-build, object-capture]
 jobs:
   ipa:
     runs-on: macos-26
